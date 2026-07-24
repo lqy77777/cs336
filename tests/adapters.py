@@ -10,7 +10,9 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from cs336_basics.bpe import train_bpe, Tokenizer
 from cs336_basics.transformer import Linear, Embedding, RMSNorm, Feedforward, RotaryPositionalEmbedding
-from cs336_basics.transformer import softmax
+from cs336_basics.transformer import softmax,scaled_dot_product_attention
+from cs336_basics.transformer import multihead_self_attention
+from cs336_basics.transformer import transformer_block, transformer_lm
 
 def run_linear(
     d_in: int,
@@ -111,7 +113,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    return scaled_dot_product_attention(Q,K,V,mask)
 
 
 def run_multihead_self_attention(
@@ -145,7 +147,10 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    attention = multihead_self_attention(d_model, num_heads)
+    attention.load_state_dict({'W_Q.weight':q_proj_weight,'W_K.weight':k_proj_weight,'W_V.weight':v_proj_weight,
+                              'W_O.weight': o_proj_weight})
+    return attention(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -185,7 +190,10 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    attention = multihead_self_attention(d_model, num_heads,theta,max_seq_len)
+    attention.load_state_dict({'W_Q.weight':q_proj_weight,'W_K.weight':k_proj_weight,'W_V.weight':v_proj_weight,
+                            'W_O.weight': o_proj_weight},strict = False)
+    return attention(in_features,token_positions)
 
 
 def run_rope(
@@ -281,8 +289,25 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    block = transformer_block(d_model,num_heads,d_ff,theta,max_seq_len)
+    new_weights = {}
+    mapping = {
+    'ln1.weight': 'rms1.weight',
+    'ln2.weight': 'rms2.weight',
+    'attn.q_proj.weight': 'attention.W_Q.weight',
+    'attn.k_proj.weight': 'attention.W_K.weight',
+    'attn.v_proj.weight': 'attention.W_V.weight',
+    'attn.output_proj.weight': 'attention.W_O.weight',
+    'ffn.w1.weight': 'ffn.W_1.weight',
+    'ffn.w2.weight': 'ffn.W_2.weight',
+    'ffn.w3.weight': 'ffn.W_3.weight',
+    }
 
+    for old_key, value in weights.items():
+        new_key = mapping.get(old_key, old_key)  # 有映射就改，没有就保持原名
+        new_weights[new_key] = value
+    block.load_state_dict(new_weights,strict = False)
+    return block(in_features)
 
 def run_transformer_lm(
     vocab_size: int,
@@ -363,8 +388,30 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
-
+    lm = transformer_lm(vocab_size, context_length, num_layers,
+                        d_model, num_heads, d_ff, rope_theta)
+    new_weights = {}
+    for old_key, value in weights.items():
+    # 复制原key，然后逐步做子串替换
+        new_key = old_key
+    
+    # 按照表格顺序，链式替换
+        new_key = new_key.replace('layers.', 'transformers.')
+        new_key = new_key.replace('token_embeddings', 'embedding')
+        new_key = new_key.replace('ln_final', 'rms')
+        new_key = new_key.replace('attn.q_proj', 'attention.W_Q')
+        new_key = new_key.replace('attn.k_proj', 'attention.W_K')
+        new_key = new_key.replace('attn.v_proj', 'attention.W_V')
+        new_key = new_key.replace('attn.output_proj', 'attention.W_O')
+        new_key = new_key.replace('ln1', 'rms1')
+        new_key = new_key.replace('ln2', 'rms2')
+        new_key = new_key.replace('ffn.w1', 'ffn.W_1')
+        new_key = new_key.replace('ffn.w2', 'ffn.W_2')
+        new_key = new_key.replace('ffn.w3', 'ffn.W_3')
+    
+        new_weights[new_key] = value
+    lm.load_state_dict(new_weights,strict = True)
+    return lm(in_indices)
 
 def run_rmsnorm(
     d_model: int,

@@ -1,6 +1,6 @@
 # `transformer.py` 开发过程知识点总结
 
-> 按写作顺序整理:`Linear` → `Embedding` → `RMSNorm` → `SiLU`/`Feedforward` → `RoPE` → `softmax`。每个组件下列出:实际踩过的坑、当前代码逐行要注意的点、以及每一处"原生写法 vs einops 写法"的对比。API 细节的展开讲解见 [PyTorch_Tensor基础.md](PyTorch_Tensor基础.md)。
+> 按写作顺序整理:`Linear` → `Embedding` → `RMSNorm` → `SiLU`/`Feedforward` → `RoPE` → `softmax` → `scaled_dot_product_attention` → `multihead_self_attention` → `transformer_block` → `transformer_lm`,最后是 adapters.py 权重加载调试。每个组件下列出:实际踩过的坑、当前代码逐行要注意的点、以及每一处"原生写法 vs einops 写法"的对比。API 细节的展开讲解见 [PyTorch_Tensor基础.md](PyTorch_Tensor基础.md)。
 
 ---
 
@@ -195,14 +195,118 @@ reduce(shifted, '... d -> ... 1', 'sum')          # einops 等价
 
 ---
 
-## 七、贯穿始终的通用知识点
+## 七、`scaled_dot_product_attention`
+
+### SDPA:踩过的坑
+
+1. **einsum 里 Q、K 的序列维用了同一个名字**——`'... seq_len d_k, ... seq_len d_k -> ... seq_len seq_len'` 报 `EinopsError: Indexing expression contains duplicate dimension "seq_len"`。query 位置和 key 位置是两个**概念上不同**的轴(讲义记号里的 `n` 和 `m`),自注意力下数值恰好相等,但 einsum 按**名字**识别维度:同名 = 同一维,而输出又要求它变成两个独立轴,自相矛盾。改成 `'... n d_k, ... m d_k -> ... n m'`——`d_k` 两输入同名且不出现在输出 → 收缩(点积);`n`、`m` 各自保留
+2. **`A.masked_fill(~mask, -inf)` 的返回值被丢弃**——不带下划线的版本返回**新 tensor**,原 `A` 纹丝不动,mask 等于没加,且**不报任何错**。症状很有辨识度:输出比参考值"更平"、普遍偏向 0(注意力泄漏到所有 key 上被平均稀释)。修法二选一:`masked_fill_`(带下划线,原地)或 `A = A.masked_fill(...)` 接住返回值
+
+### SDPA:逐行要点
+
+- 第 126 行 `d_k = Q.size(-1)`:取出的是 Python int,配 `math.sqrt` 正确
+- 第 127 行 einsum 模式 `'... n d_k, ... m d_k -> ... n m'`:两个输入只共享 `d_k`;`n`(query 数)和 `m`(key 数)是独立的两个轴——这一行本身就是 `QK^T` 形状关系的文档
+- 第 129 行 `~mask`:讲义的 mask 语义是 True=可见,而 `masked_fill` 填充的是 True 的位置——方向相反,所以要用 `~` 取反;mask 形状 `(seq, seq)`,靠广播从右对齐到分数矩阵 `(..., n, m)`
+- 第 130 行 `softmax(A, -1) @ V`:复用自己写的 softmax,归一化最后一维(= 每个 query 在所有 key 上的分布);`-inf` 过 `exp` 变 0,被屏蔽位置权重严格为 0;`@` 自动处理任意批量维
+
+### SDPA:einops 对比
+
+```python
+einsum(Q, K, '... n d_k, ... m d_k -> ... n m')   # 轴名写明"谁收缩、谁保留"
+Q @ K.mT                                           # 原生:批量矩阵转置用 .mT(高维不能用 .T)
+```
+
+---
+
+## 八、`multihead_self_attention`
+
+### MHSA:踩过的坑
+
+1. **又忘了 `super().__init__()`**(继 `Feedforward` 之后第二次)
+2. **`d_model / num_heads` 得到 float**——`/` 是真除法,`64/8 == 8.0` 不是 `8`;它一路传到 `Linear` → `torch.empty` 的形状参数,而形状参数要求 int。整除用 `//`
+3. **内部四个 `Linear` 没转发 `device`/`dtype`**——签名接收了这两个参数,创建子模块时却没传下去,外部指定 GPU 时子模块仍建在 CPU
+4. **`x @ self.W_Q.T` 和 `self.W_O @ A`**——模块实例不是 tensor:没有 `.T` 属性、也不支持 `@`(`TypeError: unsupported operand type(s) for @: 'Linear' and 'Tensor'`)。正确方式是调用:`self.W_Q(x)`。第一轮只改了 Q/K/V 三处、`W_O` 那行漏了——**同类错误要一次性搜完文件里所有出现点**
+5. **mask 和默认 `token_positions` 没带 `device`**——`torch.ones`/`torch.arange` 不传 `device` 默认建在 CPU,模型上 GPU 后运算时设备不匹配
+
+### MHSA:逐行要点
+
+- `__init__`:`d_k = d_v = d_model // num_heads`;RoPE 的 `d_k` 参数传**每头维度**(`d_model // num_heads`),不是 `d_model`;`theta`/`max_seq_len` 设为可选参数,用 `theta is not None` 决定要不要创建/应用 RoPE(兼容带 RoPE 和不带 RoPE 两个 adapter)
+- **三次大矩阵乘,不按头循环**:每个头的 `(d_k, d_model)` 投影矩阵沿输出维拼起来 = 一个 `(h·d_k, d_model)` 大矩阵,数学上完全等价。顺带:本作业配置下 `h·d_k == d_model`,权重"看着像方阵"是超参数的巧合,概念形状始终是 `(h·d_k, d_model)`
+- `rearrange('... seq_len (h d_k) -> ... h seq_len d_k', h=self.h)`:拆头 + 把 `h` 挪成批量维——之后 SDPA 和 RoPE 的 `...` 通配自动把它当批量维处理,同一份代码完全不感知"多头"的存在;`rearrange` **不是原地操作**,必须接住返回值
+- RoPE 只作用于 Q、K(V 不旋转),在**拆头之后**调用——`h` 进了 `...`,天然满足"每个头做完全相同的旋转";`token_positions` 缺省时用 `arange(seq_len)`(位置从 0 顺序排列,记得 `device`)
+- 单个 RoPE 实例可被整个模型共享:cos/sin 表在 `__init__` 里算一次、存 buffer(`persistent=False`、无可学习参数),跨层跨 batch 复用——这正是 RoPE 做成 `nn.Module` 而不是纯函数的理由(纯函数每次前向都要重算表,或者要自己维护外部缓存)
+- causal mask:`torch.tril(torch.ones(seq, seq, dtype=torch.bool))`——下三角含对角线 = "j ≤ i 可见",和讲义 mask 语义(True=可见)一致;等价写法是两个 `arange` 一列一行广播比较
+- 出口:`rearrange('... h seq_len d_v -> ... seq_len (h d_v)')` 把头拼回去(进来时拆分操作的逆),再过 `self.W_O(A)`——`W_O(A)` 走的是 `__call__` → `forward`,矩阵乘发生在 `forward` 里的 `A @ W.T`;"行向量右乘 `W^T`"与讲义列向量记号 `W_O·(…)` 是**同一个线性变换**(`y=Wx ↔ y=xW^T`,见 3.2.1 节,转置关系互相对应)
+
+### MHSA:参数 vs 激活值
+
+`self.W_Q.weight` 形状 `(h·d_k, d_model)`,**没有批量维**——参数是"学完固定、所有样本共享"的;`Q = self.W_Q(x)` 形状 `(batch, ..., seq, h·d_k)`,**有批量维**——它是对本次具体输入算出的激活值。"参数无 batch、激活有 batch"这个区别贯穿所有模块。
+
+---
+
+## 九、`transformer_block`
+
+### Block:踩过的坑
+
+1. **两个子层共用了同一个 `RMSNorm` 实例**——只建了一个 `self.rms`,`forward` 里调用两次,等于两处归一化共享同一份可学习 `weight`。参考实现的 state_dict 里 `ln1.weight`/`ln2.weight` 是两个独立 key,实锤是两个独立模块;概念上两个子层的输入分布完全不同(一个是原始 `x`,一个是加过残差的 `y`),强行共享缩放参数会束缚表达力。**每个 norm 位置一个独立实例**
+
+### Block:逐行要点
+
+- pre-norm 两条公式:`y = x + attn(norm1(x))`、`out = y + ffn(norm2(y))`——残差加的是**没被归一化的**原输入,归一化只发生在"进子层之前";这保住了一条从 embedding 直通输出、不经过任何 norm 的"干净残差流"(讲义说的梯度流动直觉)
+- 形状不变式:block 的输入输出形状完全一致 `(..., seq, d_model)`——残差连接要求两者可加,这也是最容易自查的 sanity check
+
+---
+
+## 十、`transformer_lm`
+
+### LM:踩过的坑
+
+1. **第三次忘 `super().__init__()`**——`Feedforward`、`multihead_self_attention`、`transformer_lm` 各漏一次。教训:新建任何 `nn.Module` 子类,`__init__` 第一行先落 `super().__init__()`,再写别的
+
+### LM:逐行要点
+
+- 整体结构:`Embedding(vocab_size, d_model)` → `nn.ModuleList` 里 `num_layers` 个 block 依次前向 → 最终 `RMSNorm` → `lm_head = Linear(d_model, vocab_size)` 出 logits
+- **`nn.ModuleList` 而非普通 list**:裸 list 里的子模块对注册机制不可见——`.parameters()` 收不到、`.to(device)` 不搬、`state_dict()` 里没有;`ModuleList` 行为像 list(可 append、下标访问、迭代),但每个成员都被正确注册,key 形如 `transformers.0.…`
+- 最后那次 `RMSNorm` 不属于任何 block——是模型级的收尾 norm(参考实现里的 `ln_final`),pre-norm 架构特有的"最后补一刀"
+- `lm_head` 用 `Linear` 不用 `Embedding`:两者权重形状相同(都是 `(vocab_size, d_model)`)但**用法相反**——`Embedding` 拿整数 id **查表**(花式索引),`lm_head` 拿连续向量做**矩阵乘**投到词表维;输出是未归一化的 logits,**这里不做 softmax**(归一化留给交叉熵阶段)
+- 讲义 3.4.5/3.5 的参数列表没写 `device`/`dtype`,原因有二:措辞是 "at least"(最小必需集合,不是全集);且测试全靠 `load_state_dict` 覆盖数值,组合模块自己不分配 tensor——真正需要 `device`/`dtype` 的是**叶子模块**(`Linear`/`Embedding`/`RMSNorm`,`torch.empty`/`torch.ones` 发生的地方)。保留并继续转发这两个参数是合理的自选设计,为之后训练上 GPU 留路
+
+---
+
+## 十一、adapters.py 与 `state_dict` 加载调试战
+
+### Adapter:三方分工
+
+`tests/test_*.py` 是"考卷"(课程提供、不可改),只调用 `adapters.py` 里**签名固定**的 `run_xxx`("接线员"),由它创建你的模块("引擎")、灌入**固定参考权重**、跑前向、按要求返回。灌固定权重是因为测试做的是**数值比对**——随机初始化每次输出都不同,没法和 snapshot 对答案。
+
+### Adapter:踩过的坑(按发现顺序)
+
+1. **命名对不上**:参考实现的 key(`attn.q_proj.weight`、`ln1/ln2.weight`、`ffn.w1/w2/w3.weight`、`token_embeddings`、`layers.{i}`、`ln_final`)vs 自己的属性名(`attention.W_Q`、`rms1/rms2`、`ffn.W_1/W_2/W_3`、`embedding`、`transformers.{i}`、`rms`)。`strict=True` 的报错把 **Missing**(模型要、你没给)和 **Unexpected**(你给了、模型不要)两列完整列出——**两列并排读,就是现成的改名对照表**。另外:key 末尾的 `.weight` 是 PyTorch 官方对 `Linear`/`Embedding` 内部参数的固定命名(自己实现时已天然对齐),前面的路径才是各家自取的实现细节
+2. **`strict=False` 掩盖一切**:对不上的 key 被**静默跳过**,加载不上的参数停留在随机初始化 → 测试表现为"输出 100% 大幅错误、形状完全正常",看起来像算法 bug,实际是权重根本没进去。**调试手法:临时改回 `strict=True`,逼它交代完整清单**
+3. **`dict.get(key, default)` 是整串精确匹配**:mapping 里存的 `'token_embeddings'`(缺 `.weight` 后缀)、`'layers'`(只是个片段)拿实际 key `'token_embeddings.weight'`、`'layers.0.attn.q_proj.weight'` 去查,一条都对不上,全部走 default 原样通过。而且含**变化层号**的 key(`layers.{i}.…`)根本不可能用有限张精确表覆盖 → 换 **`str.replace` 子串替换**:替换 `'layers.' → 'transformers.'` 时,层号数字不在被替换的子串里,自动原位保留——任意层数一套规则通吃;对每个 key 链式做完全部替换对,不含某子串的替换自动无操作,不需要任何 if 分支
+4. **`load_state_dict` 缩进进了 for 循环**:每往字典里放一个 key 就调用一次;`strict=True` 下第一轮(字典里只有 1 个 key)立即抛错。报错里 `state_dict = OrderedDict({…仅一个 key…})` 是识别这个病的直接线索——**报错信息里打印的实参内容值得细看**。攒完整个字典,循环外调用一次
+5. **`'ls_final'` 拼写错误**(应为 `ln_final`)——手打的字符串 key 没有编译器兜底,只能靠 strict 报错或肉眼比对抓出来
+6. **同一套方案换个入口就失效**:`test_transformer_block` 的测试代码自己先把 `layers.0.` 前缀剥掉了,所以那里"整串精确映射表"恰好够用;`run_transformer_lm` 拿到的是未剥前缀的原始 key,同样的写法立刻失效——两处 key 形态不同,方案不能照搬
+
+### Adapter:调试方法论(本次战役的沉淀)
+
+- **数值大面积错、形状全对 → 先查权重加载,再查算法**:误差幅度巨大(相对误差上千倍)、100% 位置不匹配,是"权重没进去"的典型指纹
+- **分层隔离**:LM 测试挂、而 MHSA/RoPE/SDPA/底层组件单测全绿 → bug 只可能在组装层(block/LM/adapter),不用回头怀疑底层——前提是每一层都有独立测试
+- **利用测试结构做推断**:截断输入测试与完整输入测试在相同前缀位置的 ACTUAL 输出**完全一致** → causal 性质成立、mask 无罪,一条现象直接排除一整类嫌疑。读报错不只看红绿,ACTUAL 数值本身的结构会说话
+- **动手前先读 adapter 的 weights docstring**——参考实现的 key 命名在文档里全写着,提前对齐属性名(或预留重映射的心理预算),省掉一轮返工
+
+---
+
+## 十二、贯穿始终的通用知识点
 
 ### 通用:`nn.Module` 相关
 
 - `__init__` 第一行必须 `super().__init__()`,否则 `Parameter`/子模块赋值都会报错
 - 只有 `nn.Parameter`/子模块赋值被自动追踪(`.parameters()`、`.to(device)`、`state_dict()`);普通属性是"隐形"的;`register_buffer` 介于两者之间(跟着走、不训练),`persistent=False` 再免除存档
-- `load_state_dict` 按名字拷贝值,嵌套 key 用点号路径;报错信息(Missing/Unexpected/size mismatch)会精确指出命名或形状问题
-- 调用子模块用 `module(x)` 不用 `.forward(x)`
+- `load_state_dict` 按名字拷贝值,嵌套 key 用点号路径;报错信息(Missing/Unexpected/size mismatch)会精确指出命名或形状问题;`strict=False` 会静默跳过不匹配的 key(权重保持随机初始化)——调试期一律先用默认的 `strict=True`
+- 调用子模块用 `module(x)` 不用 `.forward(x)`;`()` 走 `__call__` 协议、`@` 走 `__matmul__` 协议——`nn.Module` 只实现了前者,模块不能当矩阵参与 `@` 运算,要用权重就访问 `module.weight`
+- 一组同构子层用 `nn.ModuleList` 存;普通 Python list 对参数注册机制不可见
+- `super().__init__()` 在本文件里前后漏了三次(`Feedforward`、`multihead_self_attention`、`transformer_lm`)——写 `nn.Module` 子类的肌肉记忆:`__init__` 第一行永远是它
 
 ### 通用:张量操作
 
@@ -212,6 +316,9 @@ reduce(shifted, '... d -> ... 1', 'sum')          # einops 等价
 - 花式索引(`table[ids]`)是查表类操作的统一机制(Embedding、RoPE 查 cos/sin 表)
 - `...` 是"保留任意前置维度"的通配:索引里(`x[..., 0::2]`)和 einops 模式里(`'... a b -> ... (a b)'`)语义一致
 - `x[-1]` 砍第一维、`x[..., -1]` 取最后一维——一字之差,前者丢批量数据
+- 返回新张量的操作(`masked_fill`、`rearrange`、`transpose`…)单独一行调用而不接返回值 = **静默无效**,不报错;原地版本带 `_` 后缀(`masked_fill_`)。这是"形状对、数值错"家族里最隐蔽的成员之一
+- Python 的 `/` 永远返回 float(`64/8 == 8.0`)——传给形状参数(`torch.empty`、`Linear` 的 in/out)会出错,整除用 `//`
+- 新建 tensor(`torch.ones`/`arange`/`zeros`…)时时刻惦记 `device=`——mask、默认位置序列这类"顺手造的小张量"最容易漏,CPU/GPU 混用当场报错
 
 ### 通用:einops 使用心得(本文件所有对比的总结)
 
@@ -226,3 +333,6 @@ reduce(shifted, '... d -> ... 1', 'sum')          # einops 等价
 - 测试通过 ≠ 代码没问题:只证明"测试覆盖到的输入上结果正确"。形状对、数值错的 bug(`sum`/`mean` 之差、`keepdim` 缺失的错误广播)靠形状检查发现不了,必须数值比对
 - 报错信息往往已经精确指出问题(缺失的 key、互换的形状、不可调用的类型),仔细读报错本身是最快的排查方式
 - 语法错误(如关键字/位置参数混用)会让整个文件无法导入、**所有**测试文件连带崩溃——先保证文件能被解析,再谈逻辑对错
+- 数值大面积错、形状全对:**先怀疑权重没加载**(`strict=False` 是头号嫌疑),再怀疑算法
+- 底层组件单测全绿时,bug 只会在组装层——分层隔离(先单跑 MHSA,再看 block/LM)一次就能砍掉大半排查范围
+- 同类错误(如"模块当 tensor 用")修一处后,**立刻搜整个文件找其余出现点**——本项目 `W_Q.T` 修了、`W_O @ A` 漏了,同一天里同一个坑踩了两次

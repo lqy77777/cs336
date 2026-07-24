@@ -323,6 +323,28 @@ einsum(x, W, '... d_in, d_out d_in -> ... d_out')       # einops:靠轴名自动
 
 einsum 版本的优势:**不需要记"该转置谁"**——两个输入里同名的轴(`d_in`)自动被收缩,剩下的轴按输出模式排列,"列向量数学记号 vs 行向量代码惯例"那笔转置账它替你算了。简单场景用 `@` 更短;容易转置错、批量维多的场景 einsum 更稳。
 
+### einsum 的轴命名规则:名字相同 = 同一个维度
+
+三条核心规则:
+
+- 同一个名字出现在**多个输入**里 → 这些轴被视为**同一个维度**(长度必须一致);该名字**不出现在输出** → 沿它收缩(乘加求和);**出现在输出** → 保留
+- **输出模式里每个名字只能出现一次**——写两次同一个名字直接报 `EinopsError: Indexing expression contains duplicate dimension`
+- 两个"数值上恰好等长、但**概念上不同**"的维度,必须起**不同的名字**
+
+例子:两组向量两两做点积(得到 n×m 的分数矩阵):
+
+```python
+>>> a = torch.randn(5, 8)     # 5 个 8 维向量
+>>> b = torch.randn(7, 8)     # 7 个 8 维向量
+>>> einsum(a, b, 'n d, m d -> n m').shape     # ✓ d 收缩;n、m 各自保留
+torch.Size([5, 7])
+# einsum(a, b, 'n d, n d -> n n')             # ✗ 报错:输出里 n 重复
+```
+
+关键在于:就算两组向量恰好一样多(`n == m` 数值相等,比如自注意力里 query 数和 key 数都是 `seq_len`),第二种写法也不行——einsum 按**名字**识别维度、不按数值;同名意味着"这是同一维,要对齐",而输出想要的是两个**独立**的轴,语义自相矛盾。带批量维时 `'... n d, ... m d -> ... n m'` 同理。
+
+原生等价写法:`a @ b.mT`(高维带批量时;纯二维用 `b.T` 也行)。
+
 ## 8. 沿指定维度做归约
 
 `sum`、`mean`、`max` 等归约操作,可以指定 `dim` 参数,只沿着**这一维**归约,其他维保留:
@@ -473,7 +495,59 @@ tensor(2.7386)
 
 这个组合(平方 → 沿某一维求均值 → 加一个小常数保证数值稳定 → 开根号)正是很多归一化层的核心计算模式——具体沿哪一维求均值,取决于要保留哪些维度不被归约掉(参考第 8 节 `dim` 和 `keepdim` 的用法)。
 
-## 10. `nn.Parameter` 和 `nn.Module`
+## 10. 按布尔条件操作:`torch.where` / `masked_fill` / `tril`·`triu`
+
+### `torch.where`:按条件从两个来源逐元素选值
+
+```python
+>>> cond = torch.tensor([True, False, True])
+>>> a = torch.tensor([1., 2., 3.])
+>>> b = torch.tensor([10., 20., 30.])
+>>> torch.where(cond, a, b)
+tensor([ 1., 20.,  3.])
+```
+
+条件为 `True` 的位置取第一个来源、`False` 取第二个;三个参数都参与广播(条件可以比数据低维,自动扩展)。
+
+### `masked_fill` / `masked_fill_`:按条件填充一个常数
+
+```python
+>>> t = torch.zeros(2, 3)
+>>> mask = torch.tensor([[True, False, False], [False, True, False]])
+>>> t.masked_fill(mask, float('-inf'))      # 返回新 tensor,t 本身不变!
+>>> t.masked_fill_(mask, float('-inf'))     # 带下划线 = 原地修改 t
+```
+
+`mask` 为 `True` 的位置被填成给定标量,其余位置不动;`mask` 同样走广播(低维 mask 自动对齐到高维 tensor 的末尾几维)。
+
+**高频陷阱**:不带下划线的版本返回**新 tensor**——单独写一行 `t.masked_fill(mask, v)` 而不接收返回值,等于什么都没做,而且**不报任何错**。症状通常是"形状全对、数值不对"(该被屏蔽的位置没被屏蔽)。要么 `t = t.masked_fill(...)` 接住,要么用带下划线的原地版本。
+
+**语义方向**:`masked_fill` 填的是 `True` 的位置——如果你手里 mask 的语义是"True=保留/可见",填充前要先取反(`~mask`,`~` 是布尔逐元素取反运算符),方向想反了不会报错,结果正好颠倒。
+
+### `torch.tril` / `torch.triu`:取下/上三角
+
+```python
+>>> torch.tril(torch.ones(3, 3, dtype=torch.bool))
+tensor([[ True, False, False],
+        [ True,  True, False],
+        [ True,  True,  True]])
+```
+
+`tril` 保留下三角(**含对角线**),其余清成 0(bool 下即 `False`);`triu` 反之保留上三角。`diagonal` 参数平移分界线(`diagonal=-1` 时对角线本身也被清掉,`diagonal=1` 时多保留一条)。"位置 j ≤ 位置 i 才可见"这类因果掩码正是"下三角含对角线"的形状。
+
+等价的广播写法:两个 `arange` 一个立成列、一个躺成行,比较运算直接广播出布尔矩阵:
+
+```python
+>>> n = 3
+>>> torch.arange(n)[:, None] >= torch.arange(n)[None, :]    # 结果与上面 tril 完全相同
+```
+
+两个细节:
+
+- `dtype=bool` 里写 Python 内置的 `bool` 也是合法的——PyTorch 接受 `bool`/`int`/`float` 作为 `torch.bool`/`torch.int64`/`torch.float32` 的别名;显式写 `torch.bool` 更明确、更常规
+- 别忘了 `device=` 参数——临时构造的掩码要和参与运算的张量在同一设备,否则运算时报 device 不匹配
+
+## 11. `nn.Parameter` 和 `nn.Module`
 
 `nn.Module` 是所有神经网络层的基类(自定义层需要继承它)。`nn.Parameter` 是 `Tensor` 的一个子类,标记"这个张量是需要被训练的参数"——包在 `nn.Parameter` 里的张量,会自动被 `nn.Module` 记录,出现在 `.parameters()` 里,也会自动参与梯度计算:
 
@@ -490,10 +564,33 @@ class MyLayer(nn.Module):
 ```
 
 要点:
+
 - 必须调用 `super().__init__()`(基类构造函数),否则参数注册机制不生效
 - `forward` 方法定义"输入怎么变成输出",调用层实例(`layer(x)`)时会自动触发 `forward`
 
-## 11. `register_buffer`:非训练状态
+### 模块的调用协议:`layer(x)` 走 `__call__`,不支持 `@`
+
+`layer(x)` 能像函数一样调用,是因为 `nn.Module` 实现了 `__call__` 这个特殊方法,链路是 `layer(x)` → `layer.__call__(x)` → 内部调用你写的 `forward(x)`。所以"这一行是什么运算"完全取决于 `forward` 里写了什么——`()` 调用语法本身没有"矩阵乘法"的含义,只是恰好 `Linear.forward` 里写的是矩阵乘。
+
+反过来,`@` 运算符对应的是**另一个**特殊方法 `__matmul__`,而 `nn.Module` 没有实现它:
+
+```python
+layer @ x       # TypeError: unsupported operand type(s) for @: 'Linear' and 'Tensor'
+layer.T         # 模块也没有 .T 属性——那是 tensor 的
+layer(x)        # ✓ 模块参与计算的唯一正确姿势
+layer.weight    # 真想直接拿权重矩阵(tensor)时访问它
+```
+
+### `nn.ModuleList`:装一组子模块的专用容器
+
+普通 Python list 装子模块,`nn.Module` 的注册机制**看不见**它们——`.parameters()` 收不到、`.to(device)` 不搬、`state_dict()` 里没有。`nn.ModuleList` 行为像 list(支持 `append`、下标访问、迭代),但每个成员都被正确注册,参数以 `属性名.下标.子参数` 的形式出现在 state_dict 里(如 `layers.0.weight`)。堆叠 N 个同构子层的场景必须用它(或 `nn.Sequential`),不能用裸 list。
+
+### `load_state_dict` 的 `strict` 参数
+
+- `strict=True`(**默认**):传入的 key 必须和模块自己的 state_dict 一一对应,有出入就抛 `RuntimeError`,并把 **Missing keys**(模型有、你没给)和 **Unexpected keys**(你给了、模型没有)两份清单完整列出——这份报错本身就是最好的调试信息,两列并排读就是"命名对照表"
+- `strict=False`:对不上的 key **静默跳过**——加载不上的参数保持初始化时的随机值,不报任何错。危险之处:测试时表现为"输出数值大面积错误、形状完全正常",看起来像算法 bug,实际是权重根本没进去。调试口诀:数值大错先怀疑权重没加载,把 `strict` 临时改回 `True` 看清单
+
+## 12. `register_buffer`:非训练状态
 
 有些张量需要跟着模块走(存、读、跟 `.to(device)` 一起移动),但**不是**可训练参数(比如固定的常量、预先算好的查找表)。这种情况用 `register_buffer`:
 
@@ -506,10 +603,13 @@ class MyLayer(nn.Module):
 
 `persistent=False` 表示这个 buffer **不需要**被保存进模型的 checkpoint(通常用于"可以随时重新计算出来"的缓存值,没必要占存档空间)。
 
-## 12. 常见陷阱
+## 13. 常见陷阱
 
 - **`view` 要求内存连续**:对做过 `transpose`/`permute` 的张量直接 `.view(...)` 经常报错(`RuntimeError: view size is not compatible...`),需要先 `.contiguous()`,或者干脆用 `.reshape(...)` 代替
 - **`*` 不是矩阵乘法**:矩阵乘法要用 `@` 或 `torch.matmul`,写错很容易得到形状"恰好能广播、但语义完全错误"的结果,不会报错但结果是错的
 - **dtype 不匹配**:`float32` 的张量和 `float64` 的张量做运算可能报错或静默提升精度,需要显式 `.to(dtype)` 对齐
 - **device 不匹配**:CPU 上的张量和 GPU 上的张量不能直接运算,报错信息通常很明确(`Expected all tensors to be on the same device`)
-- **原地(in-place)操作**:方法名带下划线后缀的(比如 `.add_()`、`.mul_()`)是**原地修改**,不返回新张量;不带下划线的(`.add()`、`.mul()`)返回新张量,原张量不变——训练时对需要梯度的张量做原地操作容易破坏计算图,不确定的话优先用不带下划线的版本
+- **原地(in-place)操作**:方法名带下划线后缀的(比如 `.add_()`、`.mul_()`、`.masked_fill_()`)是**原地修改**,不返回新张量;不带下划线的(`.add()`、`.mul()`、`.masked_fill()`)返回新张量,原张量不变——训练时对需要梯度的张量做原地操作容易破坏计算图,不确定的话优先用不带下划线的版本
+- **丢弃返回值的"伪原地"调用**:`t.masked_fill(...)`、`rearrange(t, ...)`、`t.transpose(...)` 这类返回新张量的操作,单独写一行而不赋值 = **静默无效**,不报错、不警告。einops 的 `rearrange` 同样不是原地(底层是 view 还是 copy 取决于内存布局,但无论哪种,正确用法都是接住返回值)
+- **`/` 永远返回 float**:Python 的 `/` 是真除法,`64 / 8` 得 `8.0` 不是 `8`——传给要求整数的形状参数(`torch.empty(...)`、自定义 `Linear` 的 in/out 维度)会出问题;确定能整除、要整数结果时用 `//`
+- **临时小张量忘传 `device`**:`torch.ones`/`torch.arange`/`torch.zeros` 顺手构造的掩码、位置序列,不传 `device=` 默认落在 CPU——模型在 GPU 上时,一参与运算就报 device 不匹配;凡新建 tensor 都过一遍"要不要 device"这个检查
