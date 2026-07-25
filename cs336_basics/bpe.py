@@ -141,14 +141,19 @@ def train_bpe(
 class Tokenizer():
     def __init__(
             self, 
-            vocab: dict[int:bytes],
+            vocab: dict[int,bytes],
             merges: list[tuple[bytes,bytes]],
             special_tokens: list[str] = None,
     ):
         self.vocab = vocab
         self.merges = merges
+        self.max = len(merges)
         self.special_tokens = None if special_tokens is None else sorted(special_tokens, key = len, reverse = True)
         self.reversed_vocab = {v : k for k,v in vocab.items()}
+        self.rank = defaultdict(lambda: self.max)
+        for i in range(len(merges)):
+            self.rank[merges[i]] = i
+        self.escaped = '(' + '|'.join([re.escape(s) for s in self.special_tokens]) + ')' if special_tokens is not None else None
     @classmethod
     def from_files(
         cls, 
@@ -160,9 +165,10 @@ class Tokenizer():
     def encode(self, text: str) -> list[int]:
         result = []
         ids = []
+        #1.把一整段文本切成互不影响的 pretoken 单元
         if self.special_tokens is not None:
-            escaped = '(' + '|'.join([re.escape(s) for s in self.special_tokens]) + ')'
-            for para in re.split(escaped, text):
+            #括号会让被分割的东西也保留在split返回的列表里
+            for para in re.split(self.escaped, text):
                 if para in self.special_tokens:
                     result.append((para.encode('utf-8'),))
                 else:
@@ -173,33 +179,45 @@ class Tokenizer():
             for matched in re.finditer(PAT, text):
                     item = tuple(bytes([i]) for i in matched.group().encode('utf-8'))
                     result.append(item)
-        i, num_update = 0, len(self.merges)
-        while i < num_update:
-            pick = self.merges[i]
-            for n in range(len(result)):
-                item = result[n]
-                if len(item) == 1:
-                    continue
-                middle = []
-                j = 0
-                while j <= len(item) - 2:
-                    k = (item[j],item[j+1])
-                    if k != pick:
-                        middle.append(item[j])
-                    else:
-                        middle.append(item[j]+item[j+1])
-                        j += 1
-                    j += 1
-                    if j == len(item) - 1:
-                        middle.append(item[j])
-                result[n] = tuple(middle)
-            i += 1
-        for item in result:
-            if len(item) == 1:
-                ids.append(self.reversed_vocab[item[0]])
+        #2.merge  
+
+        for keys in result:
+            if len(keys) == 1:
+                ids.append(self.reversed_vocab[keys[0]])
             else:
-                for token in item:
-                    ids.append(self.reversed_vocab[token])
+                pairs = set(zip(keys[:-1],keys[1:]))
+                while True:
+                    ranks = {pair:self.rank[pair] for pair in pairs}
+                    min_pair = min(ranks,key = ranks.get)
+                    if ranks[min_pair] == self.max:
+                        for key in keys:
+                            ids.append(self.reversed_vocab[key])
+                        break
+                    i = 0
+                    temp = []
+                    while i < len(keys) - 1:
+                        pair = (keys[i],keys[i+1])
+                        if pair != min_pair:
+                            temp.append(keys[i])
+                        else:
+                            new_token = keys[i] + keys[i+1]
+                            if i != 0:
+                                pairs.add((keys[i-1],new_token))
+                            if i != len(keys)-2:
+                                pairs.add((new_token,keys[i+2]))
+                            temp.append(new_token)
+                            i += 1
+                        if i == len(keys) - 2:
+                            temp.append(keys[i+1])
+                        i += 1
+                    keys = tuple(temp)
+                    ranks[min_pair] = self.max
+                    pairs.discard(min_pair)
+                    if len(keys) == 1:
+                        ids.append(self.reversed_vocab[keys[0]])
+                        break
+
+                
         return ids
 
     def encode_iterable(
