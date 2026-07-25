@@ -8,7 +8,8 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from cs336_basics.bpe import train_bpe, Tokenizer
+from cs336_basics.bpe import train_bpe
+from cs336_basics.bpe import Tokenizer
 from cs336_basics.transformer import Linear, Embedding, RMSNorm, Feedforward, RotaryPositionalEmbedding
 from cs336_basics.transformer import softmax,scaled_dot_product_attention
 from cs336_basics.transformer import multihead_self_attention

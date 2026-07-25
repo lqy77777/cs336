@@ -1,7 +1,7 @@
 import os
 from typing import BinaryIO
 import regex as re
-from collections import Counter, defaultdict
+from collections import Counter
 from collections.abc import Iterable, Iterator
 
 #gpt-2正则
@@ -24,6 +24,7 @@ def find_chunk_boundaries(
     file.seek(0)
 
     chunk_size = file_size // desired_num_chunks
+
     # Initial guesses for chunk boundary locations, uniformly spaced
     # Chunks start on previous index, don't include last index
     chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
@@ -59,10 +60,10 @@ def train_bpe(
         **kwargs,
 ) -> tuple[dict[int,bytes], list[tuple[bytes, bytes]]]:
     #1.先创建初始词表(256+special tokens)
-    vocab = {i : bytes([i]) for i in range(256)}    #bytes函数的用法
+    vocab = {i : bytes([i]) for i in range(256)}
     for k,v in enumerate(special_tokens):
         vocab[256 + k] = v.encode('utf-8')
-    index = 256 + len(special_tokens)   #记录下一个新词的索引
+    index = 256 + len(special_tokens)
 
     #2.读取文件,确定分割点,然后pre-tokenization
     frequency = Counter()  #pre-tokenization后的frequecy_table
@@ -73,7 +74,7 @@ def train_bpe(
         boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
         for start, end in zip(boundaries[:-1], boundaries[1:]):
             f.seek(start)
-            chunk = f.read(end - start).decode("utf-8", errors="ignore") #跳过无法解码的字节
+            chunk = f.read(end - start).decode("utf-8", errors="ignore")
             for para in re.split(escaped, chunk):
                 for matched in re.finditer(PAT, para):
                     #迭代一个 bytes 对象,取出来的每个元素是 int(0-255 之间的数值),不是 bytes
@@ -81,60 +82,36 @@ def train_bpe(
                     frequency[key] += 1
     #3.merge
     merges = []
-    
-    pairs = Counter()   #记录相邻字节出现的次数
-    pairs_to_frequency = defaultdict(set)
-    for key, count in frequency.items():
-        if len(key) <= 1:   #特殊情形：单个字节无需处理
-            continue
-        for i in range(len(key)-1):
-            pair = (key[i],key[i+1])   #相邻字节对
-            pairs_to_frequency[pair].add(key)
-            pairs[pair] += count
     while index < vocab_size:
-        #次数打平的话返回字典序高的字节对  #对字典使用max函数得到的是key而不是整个字典
+        pairs = Counter()
+        for t, count in frequency.items():
+            if len(t) <= 1:
+                continue
+            for i in range(len(t)-1):
+                k = (t[i],t[i+1])
+                pairs[k] += count
         max_pair = max(pairs, key = lambda x: (pairs[x], x))
-        new_token = max_pair[0] + max_pair[1]  #两个字节拼接在一起 
-        vocab[index] = new_token 
+        vocab[index] = max_pair[0] + max_pair[1]
         merges.append(max_pair)
-        #接下来是更新frequency
-        copys = pairs_to_frequency[max_pair].copy()
-        for key in copys:
-            count = frequency[key]
-            length = len(key)
-            temp = []
-            i = 0
-            while i < length-1:
-                if (key[i],key[i+1]) != max_pair:
-                    temp.append(key[i])
-                else:
-                    if i != 0:
-                        pairs[(key[i-1],key[i])] -= count
-                        pairs[(key[i-1],new_token)] += count
-                    if i != length -2:
-                        pairs[(key[i+1],key[i+2])] -= count
-                        pairs[(new_token,key[i+2])] += count
-                    temp.append(new_token)
-                    i += 1
-                if i == length - 2:
-                    temp.append(key[i+1])
-                i += 1
-            new_key = tuple(temp)
-            frequency[new_key] = count
-            frequency.pop(key)
-            if len(new_key) == 1:
-                pass
-            else:
-                old_pairs = list(zip(key[:-1],key[1:]))
-                new_pairs = list(zip(new_key[:-1],new_key[1:]))
-                for old in old_pairs:
-                    pairs_to_frequency[old].discard(key)                       
-                for new in new_pairs:
-                    pairs_to_frequency[old].discard(key)
-                    pairs_to_frequency[new].add(new_key)
-        pairs.pop(max_pair)
         index += 1
-         
+        temp = Counter()
+        for t, count in frequency.items():
+            if len(t) <= 1:
+                continue
+            middle = []
+            i = 0
+            while i < len(t)-1:
+                k = (t[i],t[i+1])
+                if k != max_pair:
+                    middle.append(t[i])
+                else:
+                    middle.append(t[i]+t[i+1])
+                    i += 1
+                if i == len(t) - 2:
+                        middle.append(t[i+1])
+                i += 1
+            temp[tuple(middle)] = count
+        frequency = temp
 
     return (vocab,merges)
 

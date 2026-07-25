@@ -6,11 +6,6 @@ from einops import rearrange
 from jaxtyping import Float
 from torch import Tensor
 
-
-
-
-
-
 class Linear(nn.Module):
     def __init__(
             self,
