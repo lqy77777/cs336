@@ -165,5 +165,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# VSCode
+#  编辑器配置与本机路径相关(如 python.defaultInterpreterPath),不应跨机器共享
+.vscode/
+
 .ruff_cache/
 *.zip
