@@ -603,7 +603,187 @@ class MyLayer(nn.Module):
 
 `persistent=False` 表示这个 buffer **不需要**被保存进模型的 checkpoint(通常用于"可以随时重新计算出来"的缓存值,没必要占存档空间)。
 
-## 13. 常见陷阱
+## 13. 按下标查找 / 排序 / 采样
+
+### `torch.gather`:按给定下标,逐行/逐列取值
+
+```python
+>>> t = torch.tensor([[10, 20, 30], [40, 50, 60]])
+>>> idx = torch.tensor([[2, 0, 1], [1, 2, 0]])
+>>> torch.gather(t, dim=1, index=idx)
+tensor([[30, 10, 20],
+        [50, 60, 40]])
+```
+
+`dim=1` 表示"沿第 1 维查表"——结果和 `idx` **形状相同**,`result[i, j] = t[i, idx[i, j]]`(`i` 保持不变,只有 `dim` 指定的那一维被 `idx` 替换)。和第 4 节讲的"花式索引"（`table[ids]`）不同:花式索引是**整个张量**按一批下标去取,`gather` 是**沿指定维度、逐行/逐列各自独立**取值,常用于"每个样本各自选出自己关心的那个 id 对应的数值"(比如交叉熵损失手动实现、按 `argmax` 结果取回原始 logits)。
+
+### `torch.topk`:取最大的 k 个及其下标
+
+```python
+>>> x = torch.tensor([3., 9., 1., 7., 5.])
+>>> values, indices = torch.topk(x, k=2)
+>>> values
+tensor([9., 7.])
+>>> indices
+tensor([1, 3])
+```
+
+返回**已排序**的前 k 大的值和对应下标(`largest=False` 可以改成取最小的 k 个)。文本生成里的 "top-k 采样" 就是先用它筛出候选,再从这 k 个里采样。
+
+### `torch.argsort`:返回排序后的下标,而不是排好序的值
+
+```python
+>>> torch.argsort(torch.tensor([3., 1., 2.]), descending=True)
+tensor([0, 2, 1])
+```
+
+`结果[i]` 表示"排在第 `i` 位的元素,原本在哪个下标"。只关心"谁大谁小的顺序"而不关心具体数值本身时用它,比如按分数给候选排名。
+
+### `torch.multinomial`:按给定概率随机采样下标
+
+```python
+>>> probs = torch.tensor([0.1, 0.7, 0.2])
+>>> torch.multinomial(probs, num_samples=3, replacement=True)
+tensor([2, 1, 1])         # 每次运行结果不同(除非固定了随机种子)
+```
+
+输入不要求和为 1(内部会自动归一化),但必须非负。`replacement=True` 表示允许重复采样同一个下标(不加这个参数、且 `num_samples` 超过候选个数会报错)。文本生成阶段"根据 softmax 概率随机选下一个 token",标准做法正是 `torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)`。
+
+### `torch.clamp`:把数值截断在一个区间内
+
+```python
+>>> torch.clamp(torch.tensor([-2.0, 0.5, 5.0]), min=0.0, max=1.0)
+tensor([0.0000, 0.5000, 1.0000])
+```
+
+小于 `min` 的截到 `min`,大于 `max` 的截到 `max`,区间内不变。`min`、`max` 任一个可以省略(只截一侧)。常见用途:梯度裁剪、给 `log` 的输入设一个下限避免 `log(0)`。
+
+## 14. 拆分张量
+
+### `torch.chunk` / `torch.split`:`cat` 的逆操作
+
+```python
+>>> t = torch.arange(10)
+>>> [c.shape for c in torch.chunk(t, 3)]
+[torch.Size([4]), torch.Size([4]), torch.Size([2])]
+>>> [c.shape for c in torch.split(t, 4)]
+[torch.Size([4]), torch.Size([4]), torch.Size([2])]
+```
+
+`chunk(t, n)` 关心"切成几块"(尽量均分,除不尽时最后一块小一些);`split(t, size)` 关心"每块多大"(`size` 也可以传一个 list,指定每一块各自的大小)。跟 `arange` vs `linspace` 是同一种"关心数量 vs 关心大小"的对应关系。
+
+## 15. `expand` / `repeat`(原生方法,和 einops 的 `repeat` 对照)
+
+PyTorch 自带的 `.expand()` 和 `.repeat()` 是 einops `repeat` 函数底层实际调用的两种机制,提前弄清楚它们的区别,能帮你判断 einops 文档里"什么时候是视图、什么时候是拷贝"这件事:
+
+```python
+>>> a = torch.tensor([[1, 2, 3]])
+>>> a.expand(3, 3).stride()
+(0, 1)                      # 复制出来的那一维 stride=0,是广播视图,不占用新内存
+>>> a.repeat(3, 1).stride()
+(3, 1)                      # 每一份都是真实数据,占用了 3 倍内存
+```
+
+**`.expand()` 只能用在大小为 1 的维度上**(把 1 广播成 n),不允许真正复制不同大小的维度,返回的永远是视图,不消耗额外内存,但**不能写入**(写入行为等价于同时写了所有"虚拟副本",正是 einops `repeat` 一节讲过的那个坑)。**`.repeat()` 真正分配新内存、逐份拷贝数据**,可以安全写入,但更耗内存和时间。einops 的 `repeat` 函数会根据 pattern 自动选择用哪种——纯粹"增加一个新维度做广播"时走 `expand`(省内存但共享数据),需要平铺 `(r w)` 这种和已有内容交织的场景往往必须真拷贝。
+
+## 16. `.contiguous()`:让内存变得"连续"
+
+`transpose`/`permute` 之后的张量在逻辑形状变了,但底层内存排布没动(只是改了 stride),这种张量是"非连续"的:
+
+```python
+>>> x = torch.randn(3, 4)
+>>> xt = x.t()
+>>> xt.is_contiguous()
+False
+>>> xt.contiguous().is_contiguous()
+True
+>>> xt.view(-1)
+RuntimeError: view size is not compatible with input tensor's size and stride ...
+```
+
+`.view()` 要求内存连续,对着一个转置过的张量直接 `.view()` 会报错(这也是第 5 节说"不确定用 `view` 还是 `reshape` 时选 `reshape`"的原因——`reshape` 在必要时会自动帮你 `.contiguous()` 再变形,`view` 不会)。手写需要连续内存的底层操作(比如某些自定义 CUDA kernel 的输入要求)时,才需要自己显式调用 `.contiguous()`。
+
+## 17. `.detach()` vs `.clone()`:两种"脱离原张量"的方式,含义完全不同
+
+```python
+>>> a = torch.tensor([1., 2., 3.], requires_grad=True)
+>>> d = a.detach()
+>>> d.data_ptr() == a.data_ptr()
+True                     # detach 共享内存,只是切断了梯度追踪
+>>> d.requires_grad
+False
+>>> c = a.clone()
+>>> c.data_ptr() == a.data_ptr()
+False                    # clone 是独立拷贝
+>>> c.requires_grad
+True                     # 但会保留 requires_grad,且拷贝这个动作本身可导
+```
+
+**两者关注的维度完全不同,不能互相替代**:`detach` 关心"要不要参与反向传播"(数据仍是那份数据,只是从计算图上摘下来);`clone` 关心"要不要独立的内存"(数据复制一份,但如果原张量本身需要梯度,`clone` 出来的结果仍然可导、仍会把梯度传回原张量)。想要"既不共享内存、又不参与梯度"通常写 `a.clone().detach()` 或等价的 `a.detach().clone()`。
+
+## 18. `torch.no_grad()`:临时关闭梯度追踪
+
+```python
+>>> a = torch.tensor([1.0], requires_grad=True)
+>>> with torch.no_grad():
+...     b = a * 2
+>>> b.requires_grad
+False
+```
+
+`with torch.no_grad():` 代码块内,任何新产生的张量都不会被记录进计算图——不占用反向传播需要的额外内存,速度也更快。推理(inference)、验证集评估、以及"用当前权重生成一批数据但不需要对这批生成过程求导"(比如强化学习采样阶段)都应该包在这个上下文里。忘记包会导致显存占用远超预期,是训练大模型时常见的隐性开销来源。
+
+## 19. `torch.save` / `torch.load`:模型和张量的存取
+
+```python
+>>> torch.save({"weight": torch.randn(2, 2)}, "checkpoint.pt")
+>>> loaded = torch.load("checkpoint.pt", weights_only=True)
+```
+
+存的对象不限于单个 tensor,常见做法是存一个 `dict`(比如 `{"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step}`),一次性把训练现场打包。`weights_only=True` 限制反序列化只处理张量类数据,是较新版本 PyTorch 推荐的默认做法(避免加载来源不明的 checkpoint 时执行任意代码)。
+
+## 20. `torch.manual_seed`:固定随机性,让结果可复现
+
+```python
+>>> torch.manual_seed(42); x1 = torch.randn(3)
+>>> torch.manual_seed(42); x2 = torch.randn(3)
+>>> torch.equal(x1, x2)
+True
+```
+
+在任何依赖随机数的代码(初始化权重、`dropout`、`multinomial` 采样、shuffle 数据)之前调用,能让同一份代码重复跑出完全相同的结果——调试和写单元测试时几乎必用。注意 CPU 和 GPU 各有自己独立的随机数生成器,`torch.manual_seed` 会同时设置两者,但如果用到了 `numpy`/Python 内置 `random` 生成的随机数,还需要分别单独设种子。
+
+## 21. `torch.nn.functional`:常用的无状态函数
+
+`import torch.nn.functional as F` 里放的是"不需要保存参数、不需要 `nn.Module` 包装"的操作,很多和 `nn.XXX` 层是同一个底层实现的两种接口:
+
+```python
+>>> logits = torch.randn(2, 5)
+>>> F.softmax(logits, dim=-1).sum(dim=-1)
+tensor([1., 1.])                          # 沿指定维度归一化成概率分布,和为 1
+>>> target = torch.tensor([1, 3])
+>>> F.cross_entropy(logits, target)
+tensor(1.8524)                            # 内部已经包含 softmax + 取对数 + 负号,不需要自己先 softmax 再算
+```
+
+**`F.cross_entropy` 的输入是未归一化的 logits,不是概率**——如果先手动 `softmax` 再传给它,相当于对同一组数据做了两次 softmax,结果会明显偏小、训练时损失曲线看起来"过早收敛到接近 0",这是一个常见的静默错误。
+
+`nn.Softmax(dim=-1)` / `nn.CrossEntropyLoss()` 是同样计算逻辑的 `nn.Module` 封装形式,适合放进 `nn.Sequential`;`F.softmax(...)` / `F.cross_entropy(...)` 是直接调用,适合在自定义 `forward` 里临时用一下、不需要额外持有一个模块实例。
+
+## 22. `torch.equal` vs `torch.allclose`:两种"相等"
+
+```python
+>>> a = torch.tensor([1.0000001, 2.0])
+>>> b = torch.tensor([1.0, 2.0])
+>>> torch.equal(a, b)
+False                       # 要求逐元素完全一致(包括浮点误差)
+>>> torch.allclose(a, b)
+True                        # 在给定的误差容限(rtol/atol)内即算相等
+```
+
+浮点运算几乎不可能得到逐位精确相等的结果(不同的计算顺序会带来极小的舍入误差)——写单元测试比较两个张量是否"应该相等"时,几乎总该用 `allclose` 而不是 `equal`,后者对浮点数过于严格,容易把"实质正确、误差在容限内"的结果误判为失败。
+
+## 23. 常见陷阱
 
 - **`view` 要求内存连续**:对做过 `transpose`/`permute` 的张量直接 `.view(...)` 经常报错(`RuntimeError: view size is not compatible...`),需要先 `.contiguous()`,或者干脆用 `.reshape(...)` 代替
 - **`*` 不是矩阵乘法**:矩阵乘法要用 `@` 或 `torch.matmul`,写错很容易得到形状"恰好能广播、但语义完全错误"的结果,不会报错但结果是错的
@@ -613,3 +793,7 @@ class MyLayer(nn.Module):
 - **丢弃返回值的"伪原地"调用**:`t.masked_fill(...)`、`rearrange(t, ...)`、`t.transpose(...)` 这类返回新张量的操作,单独写一行而不赋值 = **静默无效**,不报错、不警告。einops 的 `rearrange` 同样不是原地(底层是 view 还是 copy 取决于内存布局,但无论哪种,正确用法都是接住返回值)
 - **`/` 永远返回 float**:Python 的 `/` 是真除法,`64 / 8` 得 `8.0` 不是 `8`——传给要求整数的形状参数(`torch.empty(...)`、自定义 `Linear` 的 in/out 维度)会出问题;确定能整除、要整数结果时用 `//`
 - **临时小张量忘传 `device`**:`torch.ones`/`torch.arange`/`torch.zeros` 顺手构造的掩码、位置序列,不传 `device=` 默认落在 CPU——模型在 GPU 上时,一参与运算就报 device 不匹配;凡新建 tensor 都过一遍"要不要 device"这个检查
+- **`F.cross_entropy` 不能先手动 softmax**:它的输入必须是未归一化的 logits(内部已经包含 softmax),多做一次 softmax 会让损失值明显偏小、看起来"训练异常顺利",实则完全错误
+- **用 `.expand()` 出来的张量做写入**:`.expand()`(以及 einops `repeat` 走 `expand` 路径产生的结果)返回的是广播视图,某一维 `stride=0`——写入会同时改写所有"虚拟副本",还会连带改坏原始数据;需要独立可写时用 `.repeat()` 或显式 `.clone()`
+- **测试里用 `torch.equal` 比较浮点数**:浮点运算几乎不可能逐位精确相等,应该用 `torch.allclose`,否则会把"数值上完全正确、只是舍入误差不同"的结果误判为测试失败
+- **忘记 `torch.no_grad()`**:推理、评估阶段如果不包一层 `no_grad`,PyTorch 会照常记录计算图,白白多占大量显存、拖慢速度,却没有任何用处(反正不会调用 `.backward()`)
