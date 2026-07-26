@@ -98,41 +98,46 @@ def train_bpe(
         vocab[index] = new_token 
         merges.append(max_pair)
         #接下来是更新frequency
-        copys = pairs_to_frequency[max_pair].copy()
-        for key in copys:
+        #由于更新的过程需要修改key，所以我们先使用的是原本frequency key的副本
+        for key in pairs_to_frequency[max_pair].copy():
             count = frequency[key]
             length = len(key)
             temp = []
             i = 0
             while i < length-1:
-                if (key[i],key[i+1]) != max_pair:
+                pair = (key[i],key[i+1])
+                pairs[pair] -= count
+                if pair != max_pair:
                     temp.append(key[i])
                 else:
-                    if i != 0:
-                        pairs[(key[i-1],key[i])] -= count
-                        pairs[(key[i-1],new_token)] += count
-                    if i != length -2:
-                        pairs[(key[i+1],key[i+2])] -= count
-                        pairs[(new_token,key[i+2])] += count
                     temp.append(new_token)
                     i += 1
+                    if i <= length - 2:
+                        pairs[(key[i],key[i+1])] -= count
                 if i == length - 2:
                     temp.append(key[i+1])
                 i += 1
+            for j in range(len(temp)-1):
+                pair = (temp[j],temp[j+1])
+                pairs[pair] += count
             new_key = tuple(temp)
             frequency[new_key] = count
             frequency.pop(key)
             if len(new_key) == 1:
-                pass
+                pass  #不可能含有pair，所以不必进行下述操作
             else:
                 old_pairs = list(zip(key[:-1],key[1:]))
                 new_pairs = list(zip(new_key[:-1],new_key[1:]))
                 for old in old_pairs:
-                    pairs_to_frequency[old].discard(key)                       
-                for new in new_pairs:
                     pairs_to_frequency[old].discard(key)
+                    if pairs[old] == 0:   #删掉僵尸key
+                        pairs.pop(old,0)
+                for new in new_pairs:
+                    pairs_to_frequency[new].discard(key)
                     pairs_to_frequency[new].add(new_key)
-        pairs.pop(max_pair)
+        pairs.pop(max_pair,0)
+        if pairs == {}:
+            break
         index += 1
          
 
@@ -150,6 +155,7 @@ class Tokenizer():
         self.max = len(merges)
         self.special_tokens = None if special_tokens is None else sorted(special_tokens, key = len, reverse = True)
         self.reversed_vocab = {v : k for k,v in vocab.items()}
+        #优先级，我们的方法是对每一个pre-token进行merge，先进行优先级最高的merge，再进行优先级低的merge
         self.rank = defaultdict(lambda: self.max)
         for i in range(len(merges)):
             self.rank[merges[i]] = i
@@ -185,26 +191,23 @@ class Tokenizer():
             if len(keys) == 1:
                 ids.append(self.reversed_vocab[keys[0]])
             else:
-                pairs = set(zip(keys[:-1],keys[1:]))
                 while True:
+                    #可能有重复的pair #word中含有的全部pair
+                    pairs = set(zip(keys[:-1],keys[1:]))
                     ranks = {pair:self.rank[pair] for pair in pairs}
                     min_pair = min(ranks,key = ranks.get)
-                    if ranks[min_pair] == self.max:
+                    if ranks[min_pair] == self.max: #merge结束
                         for key in keys:
                             ids.append(self.reversed_vocab[key])
                         break
                     i = 0
                     temp = []
+                    new_token = min_pair[0] + min_pair[1]
                     while i < len(keys) - 1:
                         pair = (keys[i],keys[i+1])
                         if pair != min_pair:
                             temp.append(keys[i])
                         else:
-                            new_token = keys[i] + keys[i+1]
-                            if i != 0:
-                                pairs.add((keys[i-1],new_token))
-                            if i != len(keys)-2:
-                                pairs.add((new_token,keys[i+2]))
                             temp.append(new_token)
                             i += 1
                         if i == len(keys) - 2:
@@ -212,8 +215,7 @@ class Tokenizer():
                         i += 1
                     keys = tuple(temp)
                     ranks[min_pair] = self.max
-                    pairs.discard(min_pair)
-                    if len(keys) == 1:
+                    if len(keys) == 1:   #无法merge
                         ids.append(self.reversed_vocab[keys[0]])
                         break
 
