@@ -186,7 +186,7 @@ class transformer_block(nn.Module):
         self.rms1 = RMSNorm(d_model,device = device, dtype = dtype)
         self.rms2 = RMSNorm(d_model,device = device, dtype = dtype)
         self.attention = multihead_self_attention(d_model,num_heads,theta,max_seq_len,device,dtype)
-        self.ffn = Feedforward(d_model, d_ff, device, dtype)
+        self.ffn = FFN(d_model, d_ff, device, dtype)
     def forward(
             self, 
             x: Tensor, 
