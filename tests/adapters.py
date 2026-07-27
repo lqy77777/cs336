@@ -10,7 +10,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from cs336_basics.bpe import train_bpe
 from cs336_basics.bpe import Tokenizer
-from cs336_basics.transformer import Linear, Embedding, RMSNorm, Feedforward, RotaryPositionalEmbedding
+from cs336_basics.transformer import Linear, Embedding, RMSNorm, FFN, RotaryPositionalEmbedding
 from cs336_basics.transformer import softmax,scaled_dot_product_attention
 from cs336_basics.transformer import multihead_self_attention
 from cs336_basics.transformer import transformer_block, transformer_lm
@@ -92,7 +92,7 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    swiglu = Feedforward(d_model, d_ff)
+    swiglu = FFN(d_model, d_ff)
     swiglu.load_state_dict({'W_1.weight':w1_weight,'W_2.weight':w2_weight,'W_3.weight':w3_weight})
     return swiglu(in_features)
 

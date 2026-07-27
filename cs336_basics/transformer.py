@@ -21,19 +21,18 @@ class Linear(nn.Module):
         self.weight = nn.Parameter(w)
 
     def forward(self, x: Tensor) -> Tensor:
-        return x @ self.weight.T
+        return einsum(self.weight,x,'out d_model, ... d_model -> ... out')
 
 class Embedding(nn.Module):
     def __init__(
             self,
-            num_embeddings: int,
-            embedding_dim: int,
+            num_embeddings: int, #size of vocabulary
+            embedding_dim: int, #d_model
             device: torch.device = None,
             dtype: torch.dtype = None,
     ):
         super().__init__()
         self.sigma = 1
-        self.embedding_dim = embedding_dim
         w = torch.empty(num_embeddings,embedding_dim, device = device, dtype = dtype)
         nn.init.trunc_normal_(w, mean = 0.0, std = self.sigma, a = -3 * self.sigma, b = 3 * self.sigma)
         self.weight = nn.Parameter(w)
@@ -62,7 +61,7 @@ class RMSNorm(nn.Module):
 def SiLU(x):
     return x * torch.sigmoid(x)
 
-class Feedforward(nn.Module):
+class FFN(nn.Module):
     def __init__(
             self,
             d_model: int,
@@ -87,9 +86,10 @@ class RotaryPositionalEmbedding(nn.Module):
     ):
         super().__init__()
         position = torch.arange(max_seq_len,device = device,dtype = torch.float32)
-        k = torch.arange(1,(d_k/2) + 1,device=device)
-        frequency = theta ** (-(2*k - 2)/ d_k)
-        rope = einsum(position, frequency, 'i,j -> i j')
+        k = torch.arange(1,(d_k/2) + 1,device = device)
+        denomitor = theta ** (-(2*k - 2)/ d_k)
+        #外积
+        rope = einsum(position, denomitor, 'i,j -> i j')
         self.register_buffer('rope_cos',torch.cos(rope),persistent = False)
         self.register_buffer('rope_sin',torch.sin(rope),persistent = False)
 
@@ -100,7 +100,7 @@ class RotaryPositionalEmbedding(nn.Module):
     ) -> Tensor:
         cosine = self.rope_cos[token_positions]
         sine = self.rope_sin[token_positions]
-        x_1 = x[..., 0:-1:2]
+        x_1 = x[..., 0::2]
         x_2 = x[..., 1::2]
         y_1 = x_1 * cosine - x_2 * sine
         y_2 = x_1 * sine + x_2 * cosine
