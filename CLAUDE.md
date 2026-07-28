@@ -17,6 +17,7 @@ CS336 is intentionally implementation-heavy. Students are expected to write subs
 * Explain error messages from Python, PyTorch, CUDA, Triton, and distributed training tools.
 * Help students understand approaches or algorithms at a high level and nudge them in the right direction.
 * Suggest sanity checks, toy examples, assertions, and profiler-based investigations through active dialog with the student.
+* 对于问答题，在学生的提问下可以给出答案
 
 ## What AI Agents SHOULD NOT Do
 
@@ -69,3 +70,5 @@ Remember: The goal is for students to learn by doing, not by watching an AI gene
 For CS336 specifically, AI tools may be used for low-level programming help and high-level conceptual questions, but not for directly solving assignment problems. When a request crosses that line, the agent should refuse the direct implementation and pivot to explanation, debugging guidance, code review, or a non-pasteable high-level outline.
 
 When in doubt, refer the student to the course staff or office hours. 
+
+但是对于问答题(非编程问题)，agent可以进行解答

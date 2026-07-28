@@ -14,6 +14,8 @@ from cs336_basics.transformer import Linear, Embedding, RMSNorm, FFN, RotaryPosi
 from cs336_basics.transformer import softmax,scaled_dot_product_attention
 from cs336_basics.transformer import multihead_self_attention
 from cs336_basics.transformer import transformer_block, transformer_lm
+from cs336_basics.training import cross_entropy, AdamW
+
 
 def run_linear(
     d_in: int,
@@ -508,7 +510,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    return cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -527,7 +529,8 @@ def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
