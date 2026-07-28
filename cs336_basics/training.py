@@ -18,8 +18,8 @@ def cross_entropy(
     denominator = torch.log(torch.sum(
         torch.exp(logits-max_logits),dim = -1))
     numerator = torch.gather(
-        logits, dim = -1,index = target.unsqueeze(-1))
-    single = - numerator + max_logits + denominator
+        logits, dim = -1,index = target.unsqueeze(-1)).squeeze(-1)
+    single = - numerator + max_logits[...,0] + denominator
     return torch.mean(single)
 
 class AdamW(torch.optim.Optimizer):
