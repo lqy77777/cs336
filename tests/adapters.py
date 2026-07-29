@@ -16,7 +16,7 @@ from cs336_basics.transformer import multihead_self_attention, SiLU
 from cs336_basics.transformer import transformer_block, transformer_lm
 from cs336_basics.optimizer import cross_entropy, AdamW
 from cs336_basics.optimizer import cosine_learning_rate, gradient_clipping
-from cs336_basics.training import data_loader, save_checkpoint,load_checkpoint
+from cs336_basics.tool import data_loader, save_checkpoint,load_checkpoint
 
 
 def run_linear(
