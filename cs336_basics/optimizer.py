@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from math import sqrt
+from math import sqrt,cos,pi
 from einops import einsum
 from einops import rearrange
 from jaxtyping import Bool, Float, Int
@@ -49,18 +49,60 @@ class AdamW(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
                 state = self.state[p] # Get state associated with p.
-                t = state.get("t", 1) # Get iteration number from the state, or 0.
-                m = state.get('m', torch.zeros(p.shape,device = p.device,dtype = p.dtype))
-                v = state.get('v', torch.zeros(p.shape,device = p.device,dtype = p.dtype))
+                t = state.get("t", 1) # Get iteration number from the state, or 1.
+                if 'm' in state:
+                    m = state['m']
+                else:
+                    m = state.get('m', torch.zeros_like(p))
+                if 'v' in state:
+                    v = state['v']
+                else:
+                    v = state.get('v', torch.zeros_like(p))
                 grad = p.grad.data # Get the gradient of loss with respect to p.
                 alpha = lr * (sqrt(1-beta_2 ** t) / (1-beta_1 ** t))
                 m = beta_1 * m + (1-beta_1) * grad
                 v = beta_2 * v + (1-beta_2) * (grad ** 2)
-                p.data = (1-lr * weight_decay) * p.data
-                p.data = p.data - alpha * (m / (torch.sqrt(v) + eps))
-                # Update weight tensor in-place.
+                #这里必须要原地运算，否则会增加内存
+                p.data -= lr * weight_decay * p.data
+                p.data -= alpha * (m / (torch.sqrt(v) + eps))
                 state['m'] = m
                 state['v'] = v
                 state["t"] = t + 1 # Increment iteration number.
         return loss
 
+def cosine_learning_rate(
+        t,
+        alpha_max,
+        alpha_min,
+        T_w,
+        T_c
+) -> float:
+    if t < T_w:
+        alpha = (t/T_w) * alpha_max
+    elif t <= T_c:
+        temp = ((t-T_w)/(T_c-T_w)) * pi
+        alpha = alpha_min + ((1+cos(temp)) * (alpha_max-alpha_min)) / 2
+    else:
+        alpha = alpha_min
+    return alpha
+
+def gradient_clipping(
+        p: Iterable[nn.Parameter],
+        M: float,
+        eps: float =1e-6
+):
+    norm = 0
+    p = list(p)
+    for parameter in p:
+        if parameter.grad is None:
+            continue
+        norm += torch.norm(parameter.grad) ** 2
+    norm = sqrt(norm)
+    if norm <= M:
+        return
+    else:
+        with torch.no_grad():
+            for parameter in p:
+                if parameter.grad is None:
+                    continue
+                parameter.grad *= ( M /( norm + eps))
