@@ -3,6 +3,7 @@ from typing import BinaryIO
 import regex as re
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
+from multiprocessing import Pool
 
 #gpt-2正则
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -52,10 +53,25 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
+
+def count_chunk(input_path: str | os.PathLike, start, end, escaped):
+    local_freq = Counter()
+    with open(input_path, 'rb') as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore") #跳过无法解码的字节
+        for para in re.split(escaped, chunk):
+            for matched in re.finditer(PAT, para):
+                #迭代一个 bytes 对象,取出来的每个元素是 int(0-255 之间的数值),不是 bytes
+                key = tuple(bytes([i]) for i in matched.group().encode('utf-8'))
+                local_freq[key] += 1
+    return local_freq
+        
+
 def train_bpe(
         input_path: str | os.PathLike,
         vocab_size: int,
         special_tokens: list[str],
+        num_processes = 4,    #进程数
         **kwargs,
 ) -> tuple[dict[int,bytes], list[tuple[bytes, bytes]]]:
     #1.先创建初始词表(256+special tokens)
@@ -68,17 +84,13 @@ def train_bpe(
     frequency = Counter()  #pre-tokenization后的frequecy_table
     #转义后的special_tokens
     escaped = '|'.join([re.escape(s) for s in special_tokens])
-    num_processes = 4    #可改
     with open(input_path, "rb") as f:
         boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            f.seek(start)
-            chunk = f.read(end - start).decode("utf-8", errors="ignore") #跳过无法解码的字节
-            for para in re.split(escaped, chunk):
-                for matched in re.finditer(PAT, para):
-                    #迭代一个 bytes 对象,取出来的每个元素是 int(0-255 之间的数值),不是 bytes
-                    key = tuple(bytes([i]) for i in matched.group().encode('utf-8'))
-                    frequency[key] += 1
+    with Pool(num_processes) as pool:
+        args = [(input_path, start, end, escaped) for start, end in zip(boundaries[:-1], boundaries[1:])]
+        freqs = pool.starmap(count_chunk,args) #starmap和map有细微差别
+    for local_freq in freqs:
+        frequency.update(local_freq)
     #3.merge
     merges = []
     
