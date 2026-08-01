@@ -13,17 +13,9 @@ import os
 from typing import BinaryIO,IO
 import argparse, sys, json, time
 
-# 两种启动方式都要能跑：
-#   python cs336_basics/train.py ...   （sys.path[0] = cs336_basics/，走 except 分支）
-#   python -m cs336_basics.train ...   （包已 pip/uv 安装，走 try 分支）
-try:
-    from cs336_basics.tool import data_loader, save_checkpoint, load_checkpoint
-    from cs336_basics.transformer import transformer_lm
-    from cs336_basics.optimizer import AdamW, cross_entropy, cosine_learning_rate, gradient_clipping
-except ImportError:
-    from tool import data_loader, save_checkpoint, load_checkpoint
-    from transformer import transformer_lm
-    from optimizer import AdamW, cross_entropy, cosine_learning_rate, gradient_clipping
+from tool import data_loader, save_checkpoint, load_checkpoint
+from transformer import transformer_lm
+from optimizer import AdamW, cross_entropy, cosine_learning_rate, grad_global_norm,gradient_clipping
 
 
 # ============ 第零层：辅助函数 ============
@@ -106,18 +98,6 @@ def evaluate(model: nn.Module, batches: list[tuple[Tensor, Tensor]]) -> float:
     return total / len(batches)
 
 
-def grad_global_norm(parameters: Iterable[nn.Parameter]) -> float:
-    """裁剪前的梯度全局范数，只在打日志的那几步算（gradient_clipping 内部算了但没返回）。
-
-    梯度范数的尖峰通常比 loss 更早预警训练发散。
-    """
-    total = None
-    for p in parameters:
-        if p.grad is None:
-            continue
-        sq = torch.sum(p.grad.detach() ** 2)
-        total = sq if total is None else total + sq
-    return 0.0 if total is None else sqrt(total.item())
 
 
 def log_jsonl(path: str, record: dict) -> None:
@@ -154,10 +134,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="（保留但不生效：每一步的 lr 都由 cosine 调度写进 param_groups）")
     parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95), metavar=("BETA1", "BETA2"))
     parser.add_argument("--eps",type = float, default = 1e-8)
-    parser.add_argument("--lr_max", type=float, default=3e-4)
-    parser.add_argument("--lr_min", type=float, default=3e-5)
-    parser.add_argument("--warmup_steps", type=int, default=0, help="线性 warmup 步数 T_w")
-    parser.add_argument("--cosine_cycle_steps", type=int, default=None,
+    parser.add_argument("--alpha_max", type=float, default=3e-4)
+    parser.add_argument("--alpha_min", type=float, default=3e-5)
+    parser.add_argument("--T_w", type=int, default=0, help="线性 warmup 步数 T_w")
+    parser.add_argument("--T_c", type=int, default=None,
                         help="余弦周期结束步数 T_c，默认等于 --total_steps")
     parser.add_argument("--total_steps", type=int, default=5000)
     parser.add_argument("--weight_decay", type=float, default=0.1)
@@ -188,10 +168,10 @@ def main(args: argparse.Namespace) -> int:
     # 早失败比晚失败便宜：下面几条如果错了，报错会发生在很深的地方，信息完全没法读。
     if args.d_model % args.num_heads != 0:
         raise ValueError(f"d_model={args.d_model} 不能被 num_heads={args.num_heads} 整除")
-    if args.cosine_cycle_steps is None:
-        args.cosine_cycle_steps = args.total_steps
-    if args.warmup_steps >= args.cosine_cycle_steps:
-        raise ValueError(f"warmup_steps={args.warmup_steps} 必须小于 cosine_cycle_steps={args.cosine_cycle_steps}")
+    if args.T_c is None:
+        args.T_c = args.total_steps
+    if args.T_w >= args.T_c:
+        raise ValueError(f"T_w={args.T_w} 必须小于 T_c={args.T_c}")
     if args.batch_size <= 0 or args.total_steps <= 0 or args.eval_batches <= 0:
         raise ValueError("batch_size、total_steps、eval_batches 都必须为正")
 
@@ -230,10 +210,10 @@ def main(args: argparse.Namespace) -> int:
     print(f"[model] {n_params:,} parameters")
 
     # ⑤ 优化器
-    # 这里传 lr_max 而不是 args.lr：构造时的 lr 只是占位，第一步就会被调度器覆盖。
-    # 传 lr_max 是为了「万一把调度那两行删了，脚本依然跑在一个合理的学习率上」。
+    # 这里传 alpha_max 而不是 args.lr：构造时的 lr 只是占位，第一步就会被调度器覆盖。
+    # 传 alpha_max 是为了「万一把调度那两行删了，脚本依然跑在一个合理的学习率上」。
     optimizer = AdamW(body.parameters(),
-                      args.lr_max,
+                      args.alpha_max,
                       tuple(args.betas),
                       args.eps,
                       args.weight_decay)
@@ -263,7 +243,7 @@ def main(args: argparse.Namespace) -> int:
     for step in range(start_step, args.total_steps):
         # 1) 算学习率，写进 param_groups
         #    必须写进 group['lr']——AdamW.step 读的就是它。写成 self.lr 之类的实例属性会静默失效。
-        lr = cosine_learning_rate(step, args.lr_max, args.lr_min, args.warmup_steps, args.cosine_cycle_steps)
+        lr = cosine_learning_rate(step, args.alpha_max, args.alpha_min, args.T_w, args.T_c)
         for group in optimizer.param_groups:
             group["lr"] = lr
 

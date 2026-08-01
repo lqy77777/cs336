@@ -12,8 +12,9 @@ from typing import Optional
 def cross_entropy(
         logits: Float[Tensor,'... vocab_size'],  
         target: Int[Tensor,'...']  #第i+1个位置的真实token编号
-) -> float:
-    
+) -> Tensor:
+    #虽然cross_entropy的结果是一个数字，但这个数字需要反向传播
+    #所以return的其实是一个0维tensor，不能是float
     max_logits = torch.max(logits,dim = -1, keepdim= True)[0]
     denominator = torch.log(torch.sum(
         torch.exp(logits-max_logits),dim = -1))
@@ -86,23 +87,31 @@ def cosine_learning_rate(
         alpha = alpha_min
     return alpha
 
+def grad_global_norm(parameters: Iterable[nn.Parameter]) -> float:
+    """裁剪前的梯度全局范数，只在打日志的那几步算（gradient_clipping 内部算了但没返回）。
+
+    梯度范数的尖峰通常比 loss 更早预警训练发散。
+    """
+    total = None
+    for p in parameters:
+        if p.grad is None:
+            continue
+        sq = torch.sum(p.grad.detach() ** 2)
+        total = sq if total is None else total + sq
+    return 0.0 if total is None else sqrt(total.item())
+
 def gradient_clipping(
         p: Iterable[nn.Parameter],
         M: float,
         eps: float =1e-6
 ):
-    norm = 0
     p = list(p)
-    for parameter in p:
-        if parameter.grad is None:
-            continue
-        norm += torch.norm(parameter.grad) ** 2
-    norm = sqrt(norm)
-    if norm <= M:
-        return
-    else:
+    norm = grad_global_norm(p)
+    if norm > M:
         with torch.no_grad():
             for parameter in p:
                 if parameter.grad is None:
                     continue
-                parameter.grad *= ( M /( norm + eps))
+                norm = ( M /( norm + eps))
+                parameter.grad *= norm
+    return norm
