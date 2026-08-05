@@ -80,7 +80,7 @@ class RotaryPositionalEmbedding(nn.Module):
     def __init__(
             self,
             theta: float,
-            d_k: int,
+            d_k: int,  #即d_model
             max_seq_len: int,
             device: torch.device = None
     ):
