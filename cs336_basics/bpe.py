@@ -4,6 +4,8 @@ import regex as re
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from multiprocessing import Pool
+import json
+from functools import lru_cache
 
 #gpt-2正则
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -61,8 +63,10 @@ def count_chunk(input_path: str | os.PathLike, start, end, escaped):
         chunk = f.read(end - start).decode("utf-8", errors="ignore") #跳过无法解码的字节
         for para in re.split(escaped, chunk):
             for matched in re.finditer(PAT, para):
+                #matched是一个正则匹配对象,.group()返回匹配到的字符串bytes对象
+                pretoken = matched.group()
                 #迭代一个 bytes 对象,取出来的每个元素是 int(0-255 之间的数值),不是 bytes
-                key = tuple(bytes([i]) for i in matched.group().encode('utf-8'))
+                key = tuple(bytes([i]) for i in pretoken.encode('utf-8'))
                 local_freq[key] += 1
     return local_freq
         
@@ -86,12 +90,14 @@ def train_bpe(
     escaped = '|'.join([re.escape(s) for s in special_tokens])
     with open(input_path, "rb") as f:
         boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-    with Pool(num_processes) as pool:
+    with Pool(num_processes) as pool: #多进程
         args = [(input_path, start, end, escaped) for start, end in zip(boundaries[:-1], boundaries[1:])]
         freqs = pool.starmap(count_chunk,args) #starmap和map有细微差别
+    #每个进程返回一个局部的 Counter。所以 freqs 是一个列表，列表的每一个元素是一个counter
     for local_freq in freqs:
         frequency.update(local_freq)
     #3.merge
+    #关键：创建pairs_to_frequency字典存储某个pair属于哪些words
     merges = []
     
     pairs = Counter()   #记录相邻字节出现的次数
@@ -171,67 +177,76 @@ class Tokenizer():
         self.rank = defaultdict(lambda: self.max)
         for i in range(len(merges)):
             self.rank[merges[i]] = i
+        #括号会让被分割的东西也保留在split返回的列表里
         self.escaped = '(' + '|'.join([re.escape(s) for s in self.special_tokens]) + ')' if special_tokens is not None else None
     @classmethod
     def from_files(
         cls, 
-        vocab_filepath: str, 
-        merges_filepath: str, 
-        special_tokens: list[str] = None,
+        filepath: str
     ):
-        pass
-    def encode(self, text: str) -> list[int]:
-        result = []
-        ids = []
-        #1.把一整段文本切成互不影响的 pretoken 单元
-        if self.special_tokens is not None:
-            #括号会让被分割的东西也保留在split返回的列表里
-            for para in re.split(self.escaped, text):
-                if para in self.special_tokens:
-                    result.append((para.encode('utf-8'),))
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        vocab = {
+            int(token_id): bytes.fromhex(token_hex)
+            for token_id, token_hex
+            in data["vocab"].items()
+        }
+        merges = [
+            (bytes.fromhex(left), bytes.fromhex(right))
+            for left, right in data["merges"]
+        ]
+        special_tokens = data.get("special_tokens", None)
+        return cls(
+            vocab=vocab,
+            merges=merges,
+            special_tokens=special_tokens,
+        )
+    #由于在merge的过程中，有大量重复的词，所以我们把他们存到缓存里，可以大大加快速度
+    @lru_cache(maxsize=100_000)
+    def _encode_pretoken(
+        self,
+        pretoken: str,
+    ) -> tuple[int, ...]:
+        keys = tuple(bytes([byte_id]) for byte_id in pretoken.encode('utf-8'))
+        if len(keys) == 1:
+            return (self.reversed_vocab[keys[0]],)
+        while True:
+            pairs = set(zip(keys[:-1], keys[1:]))
+            ranks = {pair: self.rank[pair] for pair in pairs}
+            min_pair = min(ranks, key=ranks.get)
+            if ranks[min_pair] == self.max: #merge结束
+                return tuple(self.reversed_vocab[key] for key in keys)
+            temp = []
+            new_token = min_pair[0] + min_pair[1]
+            i = 0
+            while i < len(keys) - 1:
+                pair = (keys[i], keys[i + 1])
+                if pair != min_pair:
+                    temp.append(keys[i])
                 else:
-                    for matched in re.finditer(PAT, para):
-                        item = tuple(bytes([i]) for i in matched.group().encode('utf-8'))
-                        result.append(item)
-        else:
-            for matched in re.finditer(PAT, text):
-                    item = tuple(bytes([i]) for i in matched.group().encode('utf-8'))
-                    result.append(item)
-        #2.merge  
-
-        for keys in result:
+                    temp.append(new_token)
+                    i += 1
+                if i == len(keys) - 2:
+                    temp.append(keys[i + 1])
+                i += 1
+            keys = tuple(temp)
             if len(keys) == 1:
-                ids.append(self.reversed_vocab[keys[0]])
-            else:
-                while True:
-                    #可能有重复的pair #word中含有的全部pair
-                    pairs = set(zip(keys[:-1],keys[1:]))
-                    ranks = {pair:self.rank[pair] for pair in pairs}
-                    min_pair = min(ranks,key = ranks.get)
-                    if ranks[min_pair] == self.max: #merge结束
-                        for key in keys:
-                            ids.append(self.reversed_vocab[key])
-                        break
-                    i = 0
-                    temp = []
-                    new_token = min_pair[0] + min_pair[1]
-                    while i < len(keys) - 1:
-                        pair = (keys[i],keys[i+1])
-                        if pair != min_pair:
-                            temp.append(keys[i])
-                        else:
-                            temp.append(new_token)
-                            i += 1
-                        if i == len(keys) - 2:
-                            temp.append(keys[i+1])
-                        i += 1
-                    keys = tuple(temp)
-                    ranks[min_pair] = self.max
-                    if len(keys) == 1:   #无法merge
-                        ids.append(self.reversed_vocab[keys[0]])
-                        break
-
-                
+                return (self.reversed_vocab[keys[0]],)
+            
+    def encode(self, text: str) -> list[int]:
+        ids = []
+        if self.special_tokens is not None:
+            paras = re.split(self.escaped, text)
+        else:
+            paras = (text,)
+        for para in paras:
+            if self.special_tokens is not None and para in self.special_tokens:
+                special_id = self.reversed_vocab[para.encode('utf-8')]
+                ids.append(special_id)
+                continue
+            for matched in re.finditer(PAT, para):
+                    pretoken = matched.group()
+                    ids.extend(self._encode_pretoken(pretoken))
         return ids
 
     def encode_iterable(

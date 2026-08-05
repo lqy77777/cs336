@@ -82,37 +82,38 @@ def train_bpe(
                     frequency[key] += 1
     #3.merge
     merges = []
-    while index < vocab_size:
-        pairs = Counter()
-        for t, count in frequency.items():
-            if len(t) <= 1:
-                continue
-            for i in range(len(t)-1):
-                k = (t[i],t[i+1])
-                pairs[k] += count
-        max_pair = max(pairs, key = lambda x: (pairs[x], x))
-        vocab[index] = max_pair[0] + max_pair[1]
-        merges.append(max_pair)
-        index += 1
-        temp = Counter()
-        for t, count in frequency.items():
-            if len(t) <= 1:
-                continue
-            middle = []
-            i = 0
-            while i < len(t)-1:
-                k = (t[i],t[i+1])
-                if k != max_pair:
-                    middle.append(t[i])
-                else:
-                    middle.append(t[i]+t[i+1])
-                    i += 1
-                if i == len(t) - 2:
-                        middle.append(t[i+1])
+    pair = Counter()
+    word = frequency
+    for key,value in word.items():
+        if len(key) == 1:
+            continue
+        for i in range(len(key)-1):
+            pair[(key[i],key[i+1])] += value
+    max_pair = max(pair, key = lambda x: (pair[x], x))
+    vocab[index] = max_pair[0] + max_pair[1]
+    index += 1
+    temp = Counter()
+    for key, value in word.items():
+        if len(key) == 1:
+            temp[key] += value
+            continue
+        new_word = []
+        i = 0
+        while i <= len(key)-1:
+            if (key[i],key[i+1]) == max_pair:
+                new_word.append(key[i]+key[i+1])
                 i += 1
-            temp[tuple(middle)] = count
-        frequency = temp
+            else:
+                new_word.append(key[i])
+                if i == len(key) - 2:
+                    new_word.append(key[i+1])
+                
+        temp[new_word] += value
+    word = temp
 
+
+
+            
     return (vocab,merges)
 
 class Tokenizer():

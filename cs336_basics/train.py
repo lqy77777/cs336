@@ -22,6 +22,8 @@ from optimizer import AdamW, cross_entropy, cosine_learning_rate, grad_global_no
 # 主循环里只留「每一步都要做的事」，其余都收进这里，否则 main() 会长到看不清骨架。
 
 def resolve_device(name: str) -> torch.device:
+    """把命令行中的设备名称转换成 torch.device。
+    当输入 auto 时，按 CUDA、MPS、CPU 的优先级选择设备。"""
     if name == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -34,34 +36,17 @@ def resolve_device(name: str) -> torch.device:
 
 
 def load_tokens(
-        path: str,
-        dtype: str,
-        vocab_size: int,
-        context_length: int,
-        tag: str,
+        path: str, #token文件路径
+        dtype: str, #如unit16
+        context_length: int,  #每条训练样本所含token数量
 ) -> NDArray:
-    """把 tokenize 好的 token id 数组以 memmap 方式打开，并做一次值域自检。
-
-    memmap：数据留在磁盘上，取 batch 时才把用到的那几行读进内存。
-    值域自检：dtype 读错不会报错，只会读出垃圾——但垃圾的 max 会远超 vocab_size，
-    所以这一句是抓 dtype 错误最便宜的办法（对照 Section5.3 指南 §3-区块2-③）。
+    """以内存映射方式打开.bin token 文件，并进行长度检查。
     """
-    if path.endswith(".npy"):
-        data = np.load(path, mmap_mode="r")
-    else:
-        data = np.memmap(path, dtype=np.dtype(dtype), mode="r")
+    data = np.memmap(path, dtype=np.dtype(dtype), mode="r")
 
-    if len(data) < context_length + 2:
-        raise ValueError(f"{tag} 数据只有 {len(data)} 个 token，装不下 context_length={context_length}")
+    if len(data) < context_length + 1:
+        raise ValueError(f" 数据只有 {len(data)} 个 token，装不下 context_length={context_length}")
 
-    probe = data[: min(len(data), 10_000_000)]
-    lo, hi = int(probe.min()), int(probe.max())
-    if lo < 0 or hi >= vocab_size:
-        raise ValueError(
-            f"{tag} 的 token id 落在 [{lo}, {hi}]，超出 vocab_size={vocab_size}。"
-            f"多半是 --data_dtype（当前 {data.dtype}）和保存时不一致。"
-        )
-    print(f"[data] {tag}: {len(data):,} tokens, dtype={data.dtype}, id∈[{lo}, {hi}] (抽查前 {len(probe):,} 个)")
     return data
 
 
@@ -73,12 +58,8 @@ def make_fixed_batches(
         num_batches: int,
         seed: int,
 ) -> list[tuple[Tensor, Tensor]]:
-    """预先采好一组**固定不变**的 batch，之后每次验证都喂这一组。
-
-    为什么要固定：验证曲线的抖动必须只来自模型，不能来自采样。
-    为什么要存取 RNG state：data_loader 用的是 numpy 全局随机数，
-    如果直接在这里连采 N 次，训练用的随机序列就会随 --eval_batches 变化，
-    改一个「跟模型无关」的参数会让整条训练曲线变样，实验没法对照。
+    """提前从验证集随机采样固定的一组 batch。
+    之后每次验证都使用同样的数据，避免验证曲线因为每次随机样本不同而抖动。
     """
     state = np.random.get_state()
     np.random.seed(seed)
@@ -89,7 +70,7 @@ def make_fixed_batches(
 
 @torch.no_grad()
 def evaluate(model: nn.Module, batches: list[tuple[Tensor, Tensor]]) -> float:
-    """在固定验证 batch 上求平均 loss。no_grad 省显存，eval/train 是习惯（本模型暂无 dropout）。"""
+    """在固定验证 batch 上计算平均交叉熵，并禁止构建反向传播计算图"""
     model.eval()
     total = 0.0
     for inputs, targets in batches:
@@ -192,8 +173,8 @@ def main(args: argparse.Namespace) -> int:
     print(f"[device] {device}")
 
     # ③ 数据（memmap + 值域自检）
-    train_data = load_tokens(args.train_data, args.data_dtype, args.vocab_size, args.context_length, "train")
-    val_data = load_tokens(args.val_data, args.data_dtype, args.vocab_size, args.context_length, "val")
+    train_data = load_tokens(args.train_data, args.data_dtype, args.vocab_size, args.context_length)
+    val_data = load_tokens(args.val_data, args.data_dtype, args.vocab_size, args.context_length)
 
     # ④ 模型
     body = transformer_lm(args.vocab_size,
@@ -204,14 +185,11 @@ def main(args: argparse.Namespace) -> int:
                           args.d_ff,
                           args.rope_theta,
                           device)
-    body.to(device)
-    body.train()
+    body.train()  #进入train模式
     n_params = sum(p.numel() for p in body.parameters())
     print(f"[model] {n_params:,} parameters")
 
     # ⑤ 优化器
-    # 这里传 alpha_max 而不是 args.lr：构造时的 lr 只是占位，第一步就会被调度器覆盖。
-    # 传 alpha_max 是为了「万一把调度那两行删了，脚本依然跑在一个合理的学习率上」。
     optimizer = AdamW(body.parameters(),
                       args.alpha_max,
                       tuple(args.betas),
@@ -236,7 +214,7 @@ def main(args: argparse.Namespace) -> int:
         print("[overfit] 只用一个固定 batch 训练，loss 应该一路降到接近 0")
 
     # ---------- 区块 3 + 4：主循环 + 周期性任务 ----------
-    t0 = time.time()
+    t0 = time.perf_counter()
     tokens_per_step = args.batch_size * args.context_length
     loss_value = float("nan")
 

@@ -112,6 +112,6 @@ def gradient_clipping(
             for parameter in p:
                 if parameter.grad is None:
                     continue
-                norm = ( M /( norm + eps))
-                parameter.grad *= norm
+                scale = ( M /( norm + eps))
+                parameter.grad *= scale
     return norm
