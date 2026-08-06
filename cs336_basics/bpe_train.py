@@ -82,16 +82,16 @@ def write_token_ids(
     return total_tokens
 
 def main():
-    os.makedirs("jsons", exist_ok=True)
+    os.makedirs("tokens_id", exist_ok=True)
 
     vocab_size = 10000  #uint16可以表示0-65535
     special_tokens = ['<|endoftext|>']
     num_processes = 10
     token_dtype = np.uint16  #uint16可以表示0-65535
 
-    input_path = 'data/TinyStoriesV2-GPT4-train.txt'
-    tokenizer_path = 'jsons/tinystories_tokenizer.json'
-    output_path = 'jsons/tinystories_tokens.bin'
+    input_path = 'data/TinyStoriesV2-GPT4-valid.txt'
+    tokenizer_path = 'tokens_id/tinystories_valid_tokenizer.json'
+    output_path = 'tokens_id/tinystories_valid_tokens.bin'
 
 
     t = time.perf_counter()

@@ -107,9 +107,9 @@ class RotaryPositionalEmbedding(nn.Module):
         temp = torch.stack([y_1, y_2],dim = -1)
         return rearrange(temp, '... a b -> ... (a b)')
 
-def softmax(x: Tensor, i: int) -> Tensor:
-    shifted = torch.exp(x - torch.max(x, dim = i, keepdim = True)[0])
-    denomitor = torch.sum(shifted,dim = i,keepdim=True)
+def softmax(x: Tensor, dim: int) -> Tensor:
+    shifted = torch.exp(x - torch.max(x, dim = dim, keepdim = True)[0])
+    denomitor = torch.sum(shifted,dim = dim,keepdim=True)
     return shifted / denomitor
 
 def scaled_dot_product_attention(
