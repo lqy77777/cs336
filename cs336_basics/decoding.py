@@ -74,7 +74,7 @@ def load_model(
     model.load_state_dict(checkpoint['model'], strict = True)
     return model, config
 def main():
-    prompt = "Oh shit!"
+    prompt = "I don't believe any thought exists."
     tokens_path =  "tokens_id/tinystories_train_tokenizer.json"
     tokenizer = Tokenizer.from_files(tokens_path)
     model,config = load_model('runs/experiment01/ckpt_final.pt',
